@@ -1,0 +1,332 @@
+name: DHIS2 Service CI/CD
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - 'services/dhis2-service/**'
+      - '.github/workflows/dhis2-service.yml'
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - 'services/dhis2-service/**'
+
+env:
+  SERVICE_NAME: dhis2-service
+  SERVICE_PATH: services/dhis2-service
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/dhis2-service
+
+jobs:
+  lint-and-test:
+    name: Lint and Test
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+          POSTGRES_DB: blood_bank_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('services/dhis2-service/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        working-directory: ${{ env.SERVICE_PATH }}
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install flake8 black isort mypy
+
+      - name: Lint with flake8
+        working-directory: ${{ env.SERVICE_PATH }}
+        run: |
+          # Stop the build if there are Python syntax errors or undefined names
+          flake8 app --count --select=E9,F63,F7,F82 --show-source --statistics
+          # Exit-zero treats all errors as warnings
+          flake8 app --count --exit-zero --max-complexity=10 --max-line-length=88 --statistics
+
+      - name: Format check with Black
+        working-directory: ${{ env.SERVICE_PATH }}
+        run: black --check app
+
+      - name: Import sort check with isort
+        working-directory: ${{ env.SERVICE_PATH }}
+        run: isort --check-only app
+
+      - name: Type check with mypy
+        working-directory: ${{ env.SERVICE_PATH }}
+        run: mypy app --ignore-missing-imports
+
+      - name: Run tests
+        working-directory: ${{ env.SERVICE_PATH }}
+        env:
+          DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/blood_bank_test
+          REDIS_URL: redis://localhost:6379/0
+          DHIS2_BASE_URL: https://play.dhis2.org/dev
+          DHIS2_USERNAME: admin
+          DHIS2_PASSWORD: district
+          SECRET_KEY: test-secret-key-for-ci
+          DEBUG: true
+        run: |
+          pytest tests/ -v --cov=app --cov-report=xml --cov-report=html --cov-fail-under=80
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./services/dhis2-service/coverage.xml
+          flags: dhis2-service
+          name: dhis2-service-coverage
+          fail_ci_if_error: false
+
+  build-and-push:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    if: github.event_name == 'push'
+
+    outputs:
+      image-digest: ${{ steps.build.outputs.digest }}
+      image-tags: ${{ steps.meta.outputs.tags }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push Docker image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: ./${{ env.SERVICE_PATH }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            BUILDTIME=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.created'] }}
+            VERSION=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.version'] }}
+            REVISION=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.revision'] }}
+
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.event_name == 'push'
+
+    steps:
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ needs.build-and-push.outputs.image-tags }}
+          format: 'sarif'
+          output: 'dhis2-service-trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Upload Trivy scan results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: 'dhis2-service-trivy-results.sarif'
+
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: [lint-and-test, build-and-push]
+    if: github.ref == 'refs/heads/develop' && github.event_name == 'push'
+    environment: staging
+
+    steps:
+      - name: Deploy to Railway Staging
+        uses: railwayapp/railway-deploy@v3
+        with:
+          railway_token: ${{ secrets.RAILWAY_TOKEN }}
+          service: ${{ env.SERVICE_NAME }}
+          environment: staging
+
+      - name: Wait for deployment
+        run: sleep 60
+
+      - name: Health check
+        run: |
+          max_attempts=10
+          attempt=1
+          while [ $attempt -le $max_attempts ]; do
+            if curl -f ${{ secrets.STAGING_DHIS2_URL }}/api/v1/health/live; then
+              echo "Health check passed on attempt $attempt"
+              break
+            else
+              echo "Health check failed on attempt $attempt"
+              if [ $attempt -eq $max_attempts ]; then
+                echo "Health check failed after $max_attempts attempts"
+                exit 1
+              fi
+              sleep 30
+            fi
+            attempt=$((attempt + 1))
+          done
+
+      - name: Run integration tests
+        env:
+          STAGING_URL: ${{ secrets.STAGING_DHIS2_URL }}
+        run: |
+          # Test health endpoint
+          curl -f $STAGING_URL/api/v1/health
+          
+          # Test metrics endpoint
+          curl -f $STAGING_URL/api/v1/health/metrics
+          
+          # Test API info
+          curl -f $STAGING_URL/api/v1/info
+
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [lint-and-test, build-and-push, security-scan]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: production
+
+    steps:
+      - name: Deploy to Railway Production
+        uses: railwayapp/railway-deploy@v3
+        with:
+          railway_token: ${{ secrets.RAILWAY_TOKEN }}
+          service: ${{ env.SERVICE_NAME }}
+          environment: production
+
+      - name: Wait for deployment
+        run: sleep 90
+
+      - name: Health check
+        run: |
+          max_attempts=15
+          attempt=1
+          while [ $attempt -le $max_attempts ]; do
+            if curl -f ${{ secrets.PRODUCTION_DHIS2_URL }}/api/v1/health/live; then
+              echo "Production health check passed on attempt $attempt"
+              break
+            else
+              echo "Production health check failed on attempt $attempt"
+              if [ $attempt -eq $max_attempts ]; then
+                echo "Production health check failed after $max_attempts attempts"
+                exit 1
+              fi
+              sleep 60
+            fi
+            attempt=$((attempt + 1))
+          done
+
+      - name: Run production smoke tests
+        env:
+          PRODUCTION_URL: ${{ secrets.PRODUCTION_DHIS2_URL }}
+        run: |
+          # Comprehensive health check
+          response=$(curl -s $PRODUCTION_URL/api/v1/health)
+          echo "Health response: $response"
+          
+          # Check if all services are healthy
+          echo "$response" | jq -e '.status == "healthy"'
+          echo "$response" | jq -e '.database_status == "healthy"'
+          
+          # Test readiness
+          curl -f $PRODUCTION_URL/api/v1/health/ready
+          
+          # Test API documentation
+          curl -f $PRODUCTION_URL/docs > /dev/null
+
+      - name: Create GitHub Release
+        if: success()
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: dhis2-service-v${{ github.run_number }}
+          release_name: DHIS2 Service Release v${{ github.run_number }}
+          body: |
+            ## DHIS2 Service Deployment
+            
+            **Deployed to Production**: ${{ secrets.PRODUCTION_DHIS2_URL }}
+            
+            **Changes in this release:**
+            ${{ github.event.head_commit.message }}
+            
+            **Docker Image**: ${{ needs.build-and-push.outputs.image-tags }}
+            
+            **Commit**: ${{ github.sha }}
+          draft: false
+          prerelease: false
+
+  notify:
+    name: Notify Deployment
+    runs-on: ubuntu-latest
+    needs: [deploy-production]
+    if: always()
+
+    steps:
+      - name: Notify Slack
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ needs.deploy-production.result }}
+          channel: '#deployments'
+          webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+          fields: repo,message,commit,author,action,eventName,ref,workflow
+          text: |
+            DHIS2 Service deployment to production: ${{ needs.deploy-production.result }}
+            URL: ${{ secrets.PRODUCTION_DHIS2_URL }}

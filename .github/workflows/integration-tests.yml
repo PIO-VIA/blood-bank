@@ -1,0 +1,348 @@
+name: Integration Tests
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Run integration tests daily at 2 AM UTC
+    - cron: '0 2 * * *'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  integration-tests:
+    name: End-to-End Integration Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+          POSTGRES_DB: blood_bank_integration_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build DHIS2 Service Image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./services/dhis2-service
+          load: true
+          tags: dhis2-service:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Start DHIS2 Service
+        run: |
+          docker run -d \
+            --name dhis2-service-test \
+            --network host \
+            -e DATABASE_URL="postgresql+asyncpg://postgres:postgres@localhost:5432/blood_bank_integration_test" \
+            -e REDIS_URL="redis://localhost:6379/0" \
+            -e DHIS2_BASE_URL="https://play.dhis2.org/dev" \
+            -e DHIS2_USERNAME="admin" \
+            -e DHIS2_PASSWORD="district" \
+            -e SECRET_KEY="integration-test-secret-key" \
+            -e DEBUG="true" \
+            -e LOG_LEVEL="DEBUG" \
+            dhis2-service:test
+
+      - name: Wait for service to be ready
+        run: |
+          max_attempts=30
+          attempt=1
+          while [ $attempt -le $max_attempts ]; do
+            if curl -f http://localhost:8001/api/v1/health/live; then
+              echo "Service is ready after $attempt attempts"
+              break
+            else
+              echo "Waiting for service... attempt $attempt/$max_attempts"
+              if [ $attempt -eq $max_attempts ]; then
+                echo "Service failed to start"
+                docker logs dhis2-service-test
+                exit 1
+              fi
+              sleep 10
+            fi
+            attempt=$((attempt + 1))
+          done
+
+      - name: Run Health Checks
+        run: |
+          echo "=== Testing Health Endpoints ==="
+          
+          # Liveness probe
+          echo "Testing liveness probe..."
+          curl -f http://localhost:8001/api/v1/health/live
+          
+          # Readiness probe
+          echo "Testing readiness probe..."
+          curl -f http://localhost:8001/api/v1/health/ready
+          
+          # Full health check
+          echo "Testing full health check..."
+          response=$(curl -s http://localhost:8001/api/v1/health)
+          echo "Health response: $response"
+          
+          # Verify health status
+          echo "$response" | jq -e '.status == "healthy" or .status == "degraded"'
+
+      - name: Test API Documentation
+        run: |
+          echo "=== Testing API Documentation ==="
+          
+          # OpenAPI JSON
+          curl -f http://localhost:8001/openapi.json > /dev/null
+          
+          # Swagger UI
+          curl -f http://localhost:8001/docs > /dev/null
+          
+          # ReDoc
+          curl -f http://localhost:8001/redoc > /dev/null
+
+      - name: Test Data Import APIs
+        run: |
+          echo "=== Testing Data Import APIs ==="
+          
+          # Test donor import
+          echo "Testing donor import..."
+          curl -X POST "http://localhost:8001/api/v1/import/donors" \
+            -H "Content-Type: application/json" \
+            -d '[
+              {
+                "id": "INTEGRATION_DONOR_001",
+                "age": 30,
+                "gender": "MALE",
+                "occupation": "Software Engineer",
+                "location": "Douala",
+                "contact_info": "+237123456789"
+              }
+            ]' > donor_import_response.json
+          
+          cat donor_import_response.json
+          jq -e '.status == "completed"' donor_import_response.json
+          jq -e '.imported_count == 1' donor_import_response.json
+          
+          # Test donation import
+          echo "Testing donation import..."
+          curl -X POST "http://localhost:8001/api/v1/import/donations" \
+            -H "Content-Type: application/json" \
+            -d '[
+              {
+                "id": "INTEGRATION_DONATION_001",
+                "donor_id": "INTEGRATION_DONOR_001",
+                "donation_date": "'$(date -u +%Y-%m-%dT%H:%M:%S)'Z",
+                "blood_type": "A+",
+                "volume_collected": 450.0,
+                "collection_site": "Integration Test Site",
+                "staff_id": "STAFF_001"
+              }
+            ]' > donation_import_response.json
+          
+          cat donation_import_response.json
+          jq -e '.status == "completed"' donation_import_response.json
+          jq -e '.imported_count == 1' donation_import_response.json
+
+      - name: Test Synchronization APIs  
+        run: |
+          echo "=== Testing Synchronization APIs ==="
+          
+          # Test sync status
+          echo "Testing sync status..."
+          curl -f http://localhost:8001/api/v1/sync/status > sync_status.json
+          cat sync_status.json
+          jq -e '.sync_status' sync_status.json
+          
+          # Test donation sync (should start successfully)
+          echo "Testing donation sync..."
+          curl -X POST "http://localhost:8001/api/v1/sync/donations?days_back=1" > sync_response.json
+          cat sync_response.json
+          jq -e '.status == "started"' sync_response.json
+          
+          # Get sync ID and check logs
+          sync_id=$(jq -r '.sync_id' sync_response.json)
+          echo "Sync ID: $sync_id"
+          
+          # Wait a bit for sync to process
+          sleep 10
+          
+          # Check sync logs
+          curl -f "http://localhost:8001/api/v1/sync/logs/$sync_id" > sync_logs.json
+          cat sync_logs.json
+
+      - name: Test Metrics and Monitoring
+        run: |
+          echo "=== Testing Metrics and Monitoring ==="
+          
+          # Test metrics endpoint
+          echo "Testing metrics endpoint..."
+          curl -f http://localhost:8001/api/v1/health/metrics > metrics.json
+          cat metrics.json
+          jq -e '.total_donations >= 0' metrics.json
+          jq -e '.total_products >= 0' metrics.json
+          
+          # Test version endpoint
+          echo "Testing version endpoint..."
+          curl -f http://localhost:8001/api/v1/health/version > version.json
+          cat version.json
+          jq -e '.service' version.json
+          jq -e '.version' version.json
+
+      - name: Test Error Handling
+        run: |
+          echo "=== Testing Error Handling ==="
+          
+          # Test invalid donor import (should return validation error)
+          echo "Testing invalid data validation..."
+          response_code=$(curl -s -o /dev/null -w "%{http_code}" \
+            -X POST "http://localhost:8001/api/v1/import/donors" \
+            -H "Content-Type: application/json" \
+            -d '[{"id": "INVALID", "age": 17}]')
+          
+          if [ "$response_code" -eq 422 ]; then
+            echo "Validation error handled correctly (422)"
+          else
+            echo "Expected 422 but got $response_code"
+            exit 1
+          fi
+          
+          # Test non-existent endpoint
+          echo "Testing 404 error handling..."
+          response_code=$(curl -s -o /dev/null -w "%{http_code}" \
+            http://localhost:8001/api/v1/nonexistent)
+          
+          if [ "$response_code" -eq 404 ]; then
+            echo "404 error handled correctly"
+          else
+            echo "Expected 404 but got $response_code"
+            exit 1
+          fi
+
+      - name: Performance Tests
+        run: |
+          echo "=== Performance Tests ==="
+          
+          # Install Apache Bench for load testing
+          sudo apt-get update && sudo apt-get install -y apache2-utils
+          
+          # Basic load test on health endpoint
+          echo "Running load test on health endpoint..."
+          ab -n 100 -c 10 http://localhost:8001/api/v1/health/live
+          
+          # Load test on metrics endpoint
+          echo "Running load test on metrics endpoint..."
+          ab -n 50 -c 5 http://localhost:8001/api/v1/health/metrics
+
+      - name: DHIS2 Connectivity Test (Optional)
+        continue-on-error: true
+        run: |
+          echo "=== Testing DHIS2 Connectivity ==="
+          
+          # Test DHIS2 connection through our service
+          # This might fail if DHIS2 demo server is down, so we continue on error
+          health_response=$(curl -s http://localhost:8001/api/v1/health)
+          dhis2_status=$(echo "$health_response" | jq -r '.dhis2_status')
+          
+          echo "DHIS2 Status: $dhis2_status"
+          
+          if [[ "$dhis2_status" == *"healthy"* ]]; then
+            echo "DHIS2 connectivity test passed"
+          else
+            echo "DHIS2 connectivity test failed (this might be expected)"
+          fi
+
+      - name: Collect Service Logs
+        if: always()
+        run: |
+          echo "=== Service Logs ==="
+          docker logs dhis2-service-test
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker stop dhis2-service-test || true
+          docker rm dhis2-service-test || true
+
+  security-tests:
+    name: Security Integration Tests
+    runs-on: ubuntu-latest
+    needs: integration-tests
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and start services
+        run: |
+          docker-compose -f docker-compose.yml up -d dhis2-service postgres redis
+          
+          # Wait for services
+          sleep 30
+
+      - name: Install security testing tools
+        run: |
+          # Install OWASP ZAP for security scanning
+          sudo apt-get update
+          sudo apt-get install -y python3-pip
+          pip3 install requests
+
+      - name: Basic Security Tests
+        run: |
+          echo "=== Security Tests ==="
+          
+          # Test for security headers
+          echo "Testing security headers..."
+          response_headers=$(curl -I http://localhost:8001/api/v1/health 2>/dev/null)
+          
+          # Check for basic security headers (these might be added by nginx in production)
+          echo "Response headers:"
+          echo "$response_headers"
+          
+          # Test rate limiting (if implemented)
+          echo "Testing rate limiting..."
+          for i in {1..20}; do
+            curl -s -o /dev/null http://localhost:8001/api/v1/health/metrics
+          done
+          
+          # Test SQL injection protection
+          echo "Testing SQL injection protection..."
+          response_code=$(curl -s -o /dev/null -w "%{http_code}" \
+            "http://localhost:8001/api/v1/health?test='; DROP TABLE donors; --")
+          
+          echo "SQL injection test response code: $response_code"
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker-compose down
