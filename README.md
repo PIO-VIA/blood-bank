@@ -44,7 +44,7 @@ Le système est composé de 5 microservices principaux :
 
 1. **Cloner le repository**
 ```bash
-git clone https://github.com/your-org/blood-bank-ai-system.git
+git clone https://github.com/Nathech23/High-Five.git
 cd blood-bank-ai-system
 ```
 
@@ -200,11 +200,6 @@ Le système utilise GitHub Actions pour :
 - **Staging** : Railway (branche develop)
 - **Production** : Railway (branche main)
 
-### URLs de Production
-
-- Service DHIS2: https://blood-bank-dhis2.railway.app
-- Dashboard: https://blood-bank-dashboard.vercel.app
-- Monitoring: https://blood-bank-grafana.railway.app
 
 ## 🔒 Sécurité
 
