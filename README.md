@@ -303,7 +303,7 @@ services/dhis2-service/
 
 - **Documentation** : Voir le dossier `/docs`
 - **Issues** : GitHub Issues
-- **Contact** : bpiodjiele@gmail.com
+- **Contact** : piodjiele@gmail.com
 
 ## 📄 Licence
 
