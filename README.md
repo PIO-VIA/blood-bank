@@ -44,8 +44,8 @@ Le système est composé de 5 microservices principaux :
 
 1. **Cloner le repository**
 ```bash
-git clone https://github.com/Nathech23/High-Five.git
-cd blood-bank-ai-system
+https://github.com/PIO-VIA/bloot-bank.git
+cd blood-bank-ai
 ```
 
 2. **Configurer les variables d'environnement**
