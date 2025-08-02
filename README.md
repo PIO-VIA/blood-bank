@@ -44,7 +44,7 @@ Le système est composé de 5 microservices principaux :
 
 1. **Cloner le repository**
 ```bash
-https://github.com/PIO-VIA/bloot-bank.git
+https://github.com/PIO-VIA/blood-bank.git
 cd blood-bank-ai
 ```
 
